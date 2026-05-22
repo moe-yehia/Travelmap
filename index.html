@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+  />
+  <title>Travelmap — Draw Your Route</title>
+
+  <!-- PWA install metadata -->
+  <link rel="manifest" href="manifest.webmanifest" />
+  <meta name="theme-color" content="#0e1014" />
+  <link rel="icon" type="image/svg+xml" href="icon.svg" />
+
+  <!-- iOS "Add to Home Screen" support -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Travelmap" />
+  <link rel="apple-touch-icon" href="icon.svg" />
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="map"></div>
+
+  <!-- Top right toolbar -->
+  <div class="topbar">
+    <div class="topbar-search">
+      <input
+        type="text"
+        id="jumpInput"
+        placeholder="Jump to location..."
+        autocomplete="off"
+      />
+      <div class="jump-suggestions" id="jumpSuggestions" hidden></div>
+    </div>
+    <button class="icon-btn" id="themeBtn" title="Toggle theme">☀️</button>
+  </div>
+
+  <!-- Left side route panel -->
+  <div class="panel" id="panel">
+    <div class="panel-grip"></div>
+    <div class="panel-header">
+      <h2>Draw Your Route</h2>
+      <button id="clearBtn" class="btn-clear">Clear</button>
+      <button id="minimizeBtn" class="btn-minimize" title="Minimize">−</button>
+    </div>
+    <div class="panel-body" id="panelBody">
+      <div class="loaded-route-chip" id="loadedRouteChip" hidden>
+        <span class="loaded-route-label">Editing</span>
+        <span class="loaded-route-breadcrumb" id="loadedRouteBreadcrumb"></span>
+      </div>
+      <div id="waypoints"></div>
+
+      <button class="optimize-btn" id="optimizeBtn" title="Reorder middle stops to minimize total distance. Your origin and destination always stay where you put them — including round trips back to the start.">
+        <span>✨</span> Optimize route
+      </button>
+
+      <div class="actions">
+        <button id="saveBtn"><span>💾</span> Save</button>
+        <button id="tripsBtn"><span>🗂️</span> Trips</button>
+        <button id="shareBtn"><span>🔗</span> Share</button>
+        <button id="playBtn" class="primary"><span>▶</span> Play</button>
+      </div>
+
+      <div class="distance-bar">
+        <div>
+          <div class="distance-value" id="distanceValue">0 km</div>
+          <div class="distance-label">DISTANCE</div>
+        </div>
+        <div class="unit-toggle">
+          <button class="unit" data-unit="mi">MI</button>
+          <button class="unit active" data-unit="km">KM</button>
+        </div>
+      </div>
+
+      <button class="route-info-toggle" id="routeInfoToggle">
+        Show route information
+      </button>
+      <div class="route-info" id="routeInfo" hidden></div>
+
+      <button class="discover-toggle" id="discoverToggle">
+        <span>🔍</span> Discover nearby places
+      </button>
+      <div class="discover-section" id="discoverSection" hidden>
+        <div class="discover-status" id="discoverStatus"></div>
+        <div class="suggestions-list" id="suggestionsList"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast for inline messages -->
+  <div class="toast" id="toast" hidden></div>
+
+  <!-- Custom prompt / confirm dialog (replaces window.prompt / window.confirm) -->
+  <div class="modal app-dialog" id="appDialog" hidden>
+    <div class="modal-content app-dialog-content">
+      <div class="app-dialog-title" id="appDialogTitle"></div>
+      <div class="app-dialog-message" id="appDialogMessage" hidden></div>
+      <input class="app-dialog-input" id="appDialogInput" hidden />
+      <div class="app-dialog-actions">
+        <button class="app-dialog-cancel" id="appDialogCancel">Cancel</button>
+        <button class="app-dialog-confirm" id="appDialogConfirm">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Trips dialog: trip → day → route hierarchy -->
+  <div class="modal" id="tripsModal" hidden>
+    <div class="modal-content trips-modal">
+      <div class="modal-header">
+        <h3>My trips</h3>
+        <button class="btn-minimize" id="tripsCloseBtn">×</button>
+      </div>
+      <div class="trips-body" id="tripsBody"></div>
+      <div class="trips-footer">
+        <button class="trips-new-trip" id="newTripBtn">+ New trip</button>
+      </div>
+    </div>
+  </div>
+
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+  <script src="app.js"></script>
+</body>
+</html>
