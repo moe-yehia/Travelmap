@@ -772,43 +772,26 @@ async function optimizeOrder() {
     matrix = haversineMatrix(coords);
   }
 
-  // The origin is always kept in place. Whether the LAST waypoint is kept
-  // in place is decided ONLY by the user via the "Return to start" toggle.
-  // Toggle off → last waypoint is a regular point that the optimizer can
-  // reorder. Toggle on → last waypoint is fixed and not included in the
-  // permutation set.
+  // Only the starting point (index 0) is fixed. Every other waypoint —
+  // including whatever is currently last — is just a regular point in the
+  // set and can be reordered freely to minimize total distance.
   const N = wps.length;
-  const lastIdx = N - 1;
-  const lockEnd = $('lockEndpoints')?.checked ?? false;
 
   if (N < 3) {
-    toast('Add at least one stop between your origin and destination');
-    return;
-  }
-  if (lockEnd && N < 4) {
-    toast('Add at least 2 stops between your start and end to optimize a round trip');
+    toast('Add at least one stop after your starting point');
     return;
   }
 
-  // Build the permutation set + the "before" baseline.
-  let middle, beforeOrder, wrap;
-  if (lockEnd) {
-    middle = Array.from({ length: N - 2 }, (_, i) => i + 1);
-    beforeOrder = [0, ...middle, lastIdx];
-    wrap = (perm) => [0, ...perm, lastIdx];
-  } else {
-    middle = Array.from({ length: N - 1 }, (_, i) => i + 1);
-    beforeOrder = [0, ...middle];
-    wrap = (perm) => [0, ...perm];
-  }
+  const rest = Array.from({ length: N - 1 }, (_, i) => i + 1);
+  const beforeOrder = [0, ...rest];
   const beforeDist = pathDistance(matrix, beforeOrder);
 
   let bestOrder;
-  if (middle.length <= 8) {
-    // Brute force — up to 8! = 40,320 permutations, instant in JS
+  if (rest.length <= 8) {
+    // Brute force — up to 8! = 40,320 permutations. Instant in JS.
     let bestDist = Infinity;
-    for (const perm of permutations(middle)) {
-      const order = wrap(perm);
+    for (const perm of permutations(rest)) {
+      const order = [0, ...perm];
       const d = pathDistance(matrix, order);
       if (d < bestDist) {
         bestDist = d;
@@ -816,11 +799,8 @@ async function optimizeOrder() {
       }
     }
   } else {
-    // Too many for brute force — nearest neighbor + 2-opt. twoOpt() already
-    // preserves the first and last positions, so when we lock the end the
-    // last position stays put. When we don't lock the end, we pass no
-    // forced final node so NN picks the best path.
-    bestOrder = nearestNeighborOrder(matrix, 0, middle, lockEnd ? lastIdx : null);
+    // Too many for brute force — nearest neighbor + 2-opt.
+    bestOrder = nearestNeighborOrder(matrix, 0, rest);
     bestOrder = twoOpt(matrix, bestOrder);
   }
 
