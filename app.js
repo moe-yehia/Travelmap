@@ -773,16 +773,13 @@ async function optimizeOrder() {
   }
 
   // The origin is always kept in place. Whether the LAST waypoint is kept
-  // in place (a "returning point" / round trip) is up to the user, via the
-  // "Return to start" checkbox. We auto-detect when the first and last
-  // waypoints are at the same physical location — in that case the route
-  // is clearly a round trip and we don't bother asking.
+  // in place is decided ONLY by the user via the "Return to start" toggle.
+  // Toggle off → last waypoint is a regular point that the optimizer can
+  // reorder. Toggle on → last waypoint is fixed and not included in the
+  // permutation set.
   const N = wps.length;
   const lastIdx = N - 1;
-  const autoDetectedRoundTrip =
-    N >= 2 && haversine(wps[0].latlng, wps[lastIdx].latlng) < 100;
-  const userWantsLockedEnd = $('lockEndpoints')?.checked ?? false;
-  const lockEnd = autoDetectedRoundTrip || userWantsLockedEnd;
+  const lockEnd = $('lockEndpoints')?.checked ?? false;
 
   if (N < 3) {
     toast('Add at least one stop between your origin and destination');
@@ -839,12 +836,11 @@ async function optimizeOrder() {
   btn.disabled = false;
   btn.innerHTML = originalText;
 
-  const tripLabel = isRoundTrip ? 'Round trip · ' : '';
   if (afterDist >= beforeDist - 1) {
-    toast(`${tripLabel}Order is already optimal`);
+    toast('Order is already optimal');
   } else {
     const saved = ((beforeDist - afterDist) / 1000).toFixed(2);
-    toast(`${tripLabel}Reordered — saved ~${saved} km`);
+    toast(`Reordered — saved ~${saved} km`);
   }
   renderPanel();
   refreshMap();
