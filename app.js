@@ -158,9 +158,29 @@ function toast(msg, ms = 2200) {
 
 let _dialogResolver = null;
 let _dialogKeyHandler = null;
+let _dialogHiddenModals = [];
+
+function _hideOtherModalsForDialog() {
+  // Hide any other open modal (e.g. the Trips modal) so the dialog is the
+  // only thing on screen. We remember which ones were open so we can put
+  // them back when the dialog closes.
+  _dialogHiddenModals = [];
+  document.querySelectorAll('.modal').forEach((m) => {
+    if (m.id !== 'appDialog' && !m.hidden) {
+      _dialogHiddenModals.push(m);
+      m.hidden = true;
+    }
+  });
+}
+
+function _restoreModalsAfterDialog() {
+  _dialogHiddenModals.forEach((m) => (m.hidden = false));
+  _dialogHiddenModals = [];
+}
 
 function _closeDialog(value) {
   $('appDialog').hidden = true;
+  _restoreModalsAfterDialog();
   if (_dialogKeyHandler) {
     document.removeEventListener('keydown', _dialogKeyHandler);
     _dialogKeyHandler = null;
@@ -183,6 +203,7 @@ function askInput({
 
   return new Promise((resolve) => {
     _dialogResolver = resolve;
+    _hideOtherModalsForDialog();
     const dlg = $('appDialog');
     $('appDialogTitle').textContent = title || '';
     const msgEl = $('appDialogMessage');
@@ -227,6 +248,7 @@ function askConfirm({
 
   return new Promise((resolve) => {
     _dialogResolver = resolve;
+    _hideOtherModalsForDialog();
     const dlg = $('appDialog');
     $('appDialogTitle').textContent = title || '';
     const msgEl = $('appDialogMessage');
@@ -750,27 +772,38 @@ async function optimizeOrder() {
     matrix = haversineMatrix(coords);
   }
 
-  // Always keep the user's origin and destination in place — they placed
-  // them there deliberately. We auto-detect round trips (where the start
-  // and end are the same physical location) so we can surface that in the
-  // result toast, but the optimization itself is identical: only the
-  // middle stops get reordered.
+  // The origin is always kept in place. Whether the LAST waypoint is kept
+  // in place (a "returning point" / round trip) is up to the user, via the
+  // "Return to start" checkbox. We auto-detect when the first and last
+  // waypoints are at the same physical location — in that case the route
+  // is clearly a round trip and we don't bother asking.
   const N = wps.length;
   const lastIdx = N - 1;
-  const isRoundTrip =
+  const autoDetectedRoundTrip =
     N >= 2 && haversine(wps[0].latlng, wps[lastIdx].latlng) < 100;
+  const userWantsLockedEnd = $('lockEndpoints')?.checked ?? false;
+  const lockEnd = autoDetectedRoundTrip || userWantsLockedEnd;
 
-  if (N < 4) {
-    toast(
-      isRoundTrip
-        ? 'Add at least 2 stops between your start and end to optimize a round trip'
-        : 'Add at least 2 stops between your origin and destination to optimize'
-    );
+  if (N < 3) {
+    toast('Add at least one stop between your origin and destination');
+    return;
+  }
+  if (lockEnd && N < 4) {
+    toast('Add at least 2 stops between your start and end to optimize a round trip');
     return;
   }
 
-  const middle = Array.from({ length: N - 2 }, (_, i) => i + 1);
-  const beforeOrder = [0, ...middle, lastIdx];
+  // Build the permutation set + the "before" baseline.
+  let middle, beforeOrder, wrap;
+  if (lockEnd) {
+    middle = Array.from({ length: N - 2 }, (_, i) => i + 1);
+    beforeOrder = [0, ...middle, lastIdx];
+    wrap = (perm) => [0, ...perm, lastIdx];
+  } else {
+    middle = Array.from({ length: N - 1 }, (_, i) => i + 1);
+    beforeOrder = [0, ...middle];
+    wrap = (perm) => [0, ...perm];
+  }
   const beforeDist = pathDistance(matrix, beforeOrder);
 
   let bestOrder;
@@ -778,7 +811,7 @@ async function optimizeOrder() {
     // Brute force — up to 8! = 40,320 permutations, instant in JS
     let bestDist = Infinity;
     for (const perm of permutations(middle)) {
-      const order = [0, ...perm, lastIdx];
+      const order = wrap(perm);
       const d = pathDistance(matrix, order);
       if (d < bestDist) {
         bestDist = d;
@@ -787,8 +820,10 @@ async function optimizeOrder() {
     }
   } else {
     // Too many for brute force — nearest neighbor + 2-opt. twoOpt() already
-    // preserves the first and last positions, so the endpoints stay fixed.
-    bestOrder = nearestNeighborOrder(matrix, 0, middle, lastIdx);
+    // preserves the first and last positions, so when we lock the end the
+    // last position stays put. When we don't lock the end, we pass no
+    // forced final node so NN picks the best path.
+    bestOrder = nearestNeighborOrder(matrix, 0, middle, lockEnd ? lastIdx : null);
     bestOrder = twoOpt(matrix, bestOrder);
   }
 

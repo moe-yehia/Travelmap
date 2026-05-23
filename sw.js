@@ -1,5 +1,6 @@
 // Travelmap service worker — enables offline use + home-screen install.
-const APP_CACHE = 'travelmap-shell-v1';
+// Bump APP_CACHE whenever the shell changes to invalidate old caches.
+const APP_CACHE = 'travelmap-shell-v3';
 const TILE_CACHE = 'travelmap-tiles-v1';
 
 const SHELL_ASSETS = [
@@ -77,23 +78,27 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // App shell — stale-while-revalidate so the app opens instantly offline
-  // but still picks up updates when online.
+  // App shell — network-first with cache fallback. When online, users
+  // always get the latest HTML/CSS/JS. When offline, the cached copy keeps
+  // the app working. (Stale-while-revalidate showed stale code for an
+  // extra reload after every deploy, which is a bad dev experience.)
   if (
     url.origin === self.location.origin ||
     /unpkg\.com\/leaflet/.test(url.host)
   ) {
     event.respondWith(
-      caches.open(APP_CACHE).then(async (cache) => {
-        const cached = await cache.match(req);
-        const network = fetch(req)
-          .then((resp) => {
-            if (resp.ok) cache.put(req, resp.clone());
-            return resp;
-          })
-          .catch(() => cached);
-        return cached || network;
-      })
+      (async () => {
+        const cache = await caches.open(APP_CACHE);
+        try {
+          const fresh = await fetch(req);
+          if (fresh.ok) cache.put(req, fresh.clone());
+          return fresh;
+        } catch (e) {
+          const cached = await cache.match(req);
+          if (cached) return cached;
+          throw e;
+        }
+      })()
     );
   }
 });

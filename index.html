@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta
     name="viewport"
-    content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover"
   />
   <title>Travelmap — Draw Your Route</title>
 
@@ -59,9 +59,13 @@
       </div>
       <div id="waypoints"></div>
 
-      <button class="optimize-btn" id="optimizeBtn" title="Reorder middle stops to minimize total distance. Your origin and destination always stay where you put them — including round trips back to the start.">
+      <button class="optimize-btn" id="optimizeBtn" title="Reorder stops to minimize total distance">
         <span>✨</span> Optimize route
       </button>
+      <label class="optimize-option" title="Turn on when you want the last waypoint to stay fixed (e.g. you're returning to your hotel). When off, the optimizer is free to reorder the last stop too.">
+        <input type="checkbox" id="lockEndpoints" />
+        <span>Return to start (round trip)</span>
+      </label>
 
       <div class="actions">
         <button id="saveBtn"><span>💾</span> Save</button>
