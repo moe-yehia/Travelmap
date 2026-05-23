@@ -1,6 +1,6 @@
 // Travelmap service worker — enables offline use + home-screen install.
 // Bump APP_CACHE whenever the shell changes to invalidate old caches.
-const APP_CACHE = 'travelmap-shell-v4';
+const APP_CACHE = 'travelmap-shell-v7';
 const TILE_CACHE = 'travelmap-tiles-v1';
 
 const SHELL_ASSETS = [

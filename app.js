@@ -3,19 +3,25 @@
    Vanilla JS app: Leaflet + OSRM + Nominatim
    ========================================================= */
 
+// `kph` is used for modes that don't go through OSRM (train/boat/plane) so
+// we can still show a sensible time estimate. `overheadMin` is extra fixed
+// time (e.g. boarding/security for flights).
 const MODES = [
-  { id: 'walk',  icon: '🚶', label: 'Walk',  profile: 'foot',    color: '#3fb950' },
-  { id: 'bike',  icon: '🚴', label: 'Bike',  profile: 'cycling', color: '#f0c14a' },
-  { id: 'car',   icon: '🚗', label: 'Car',   profile: 'driving', color: '#4f8cff' },
-  { id: 'bus',   icon: '🚌', label: 'Bus',   profile: 'driving', color: '#a855f7' },
-  { id: 'train', icon: '🚆', label: 'Train', profile: null,      color: '#f04a4a' },
-  { id: 'boat',  icon: '⛴️', label: 'Boat',  profile: null,      color: '#2dd4bf' },
-  { id: 'plane', icon: '✈️', label: 'Plane', profile: null,      color: '#ec4899' },
+  { id: 'walk',  icon: '🚶', label: 'Walk',  profile: 'foot',    color: '#3fb950', kph: 5 },
+  { id: 'bike',  icon: '🚴', label: 'Bike',  profile: 'cycling', color: '#f0c14a', kph: 15 },
+  { id: 'car',   icon: '🚗', label: 'Car',   profile: 'driving', color: '#4f8cff', kph: 50 },
+  { id: 'bus',   icon: '🚌', label: 'Bus',   profile: 'driving', color: '#a855f7', kph: 25 },
+  { id: 'train', icon: '🚆', label: 'Train', profile: null,      color: '#f04a4a', kph: 80,  overheadMin: 10 },
+  { id: 'boat',  icon: '⛴️', label: 'Boat',  profile: null,      color: '#2dd4bf', kph: 30,  overheadMin: 15 },
+  { id: 'plane', icon: '✈️', label: 'Plane', profile: null,      color: '#ec4899', kph: 700, overheadMin: 90 },
 ];
 
 const MODE_BY_ID = Object.fromEntries(MODES.map(m => [m.id, m]));
 
 const NOMINATIM = 'https://nominatim.openstreetmap.org';
+// Transitous — community-run public transit routing with real GTFS data
+// for many cities worldwide. Used when the user picks train or bus mode.
+const TRANSITOUS = 'https://api.transitous.org/api/v2/plan';
 // Overpass mirrors. Primary first; the rest are fallbacks that may be down at
 // any given moment. We use GET (not POST) so we avoid a CORS preflight, which
 // some browsers/extensions/networks block.
@@ -67,6 +73,10 @@ const state = {
   activeContext: null, // { tripId, dayId, routeId } when editing a trip-bound route
   suggestions: [],
   showDiscover: false,
+  // Schedule
+  startTime: '',    // "HH:MM" — when the day starts at waypoint A. Empty = no schedule.
+  // Each waypoint also carries a `stayMin` field (minutes spent there before
+  // moving on). It lives on the waypoint itself.
 };
 
 // ---------------- MAP ----------------
@@ -110,6 +120,41 @@ let playAnimHandle = null;
 const fmtKm = (m) => (m / 1000).toFixed(m < 10000 ? 2 : 1);
 const fmtMi = (m) => (m / 1609.344).toFixed(m < 16000 ? 2 : 1);
 const fmtMin = (s) => Math.max(1, Math.round(s / 60));
+
+// "82 min" → "1h 22m" when long enough to be friendlier as h+m
+function fmtDuration(seconds) {
+  if (!seconds || seconds < 1) return '0 min';
+  const totalMin = Math.max(1, Math.round(seconds / 60));
+  if (totalMin < 60) return `${totalMin} min`;
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return m === 0 ? `${h}h` : `${h}h ${m}m`;
+}
+
+// "13:00" + 90 minutes → "14:30". Returns null if the input is malformed.
+// Always returns 24-hour HH:MM for internal storage (the <input type="time">
+// element expects this regardless of locale).
+function addMinutesToTime(hhmm, minutes) {
+  if (!hhmm) return null;
+  const [h, m] = hhmm.split(':').map(Number);
+  if (Number.isNaN(h) || Number.isNaN(m)) return null;
+  const totalMin = h * 60 + m + Math.round(minutes);
+  const wrapped = ((totalMin % 1440) + 1440) % 1440;
+  const nh = Math.floor(wrapped / 60);
+  const nm = wrapped % 60;
+  return `${String(nh).padStart(2, '0')}:${String(nm).padStart(2, '0')}`;
+}
+
+// Internal 24h "13:30" → user-facing 12h "1:30 PM". Used everywhere a time
+// is displayed; storage and arithmetic stay 24h to avoid AM/PM bugs.
+function fmtTime12(hhmm) {
+  if (!hhmm) return '';
+  const [h, m] = hhmm.split(':').map(Number);
+  if (Number.isNaN(h) || Number.isNaN(m)) return hhmm;
+  const period = h >= 12 ? 'PM' : 'AM';
+  const h12 = h % 12 || 12;
+  return `${h12}:${String(m).padStart(2, '0')} ${period}`;
+}
 
 function letterFor(i) {
   return String.fromCharCode(65 + i); // A, B, ...
@@ -360,22 +405,202 @@ async function routeOSRM(profile, from, to) {
   };
 }
 
-function straightSegment(from, to) {
-  return {
-    coords: [from, to],
-    distance: haversine(from, to),
-    duration: 0,
-  };
+function straightSegment(from, to, mode) {
+  const m = MODE_BY_ID[mode];
+  const distance = haversine(from, to);
+  // distance is in meters; (m/1000)/kph * 3600 = seconds
+  let duration = 0;
+  if (m && m.kph) {
+    duration = ((distance / 1000) / m.kph) * 3600;
+    if (m.overheadMin) duration += m.overheadMin * 60;
+  }
+  return { coords: [from, to], distance, duration };
 }
 
 async function computeSegment(mode, from, to) {
   const m = MODE_BY_ID[mode];
-  if (!m || !m.profile) return straightSegment(from, to);
+  if (!m || !m.profile) return straightSegment(from, to, mode);
   try {
     return await routeOSRM(m.profile, from, to);
   } catch (e) {
     console.warn('Routing failed, falling back to straight line', e);
-    return straightSegment(from, to);
+    return straightSegment(from, to, mode);
+  }
+}
+
+// ---------------- TRANSIT (Transitous / GTFS) ----------------
+// Transitous is built on the Motis routing engine and aggregates GTFS feeds
+// from many transit agencies worldwide. We hit it for "train" and "bus" mode
+// segments to surface real lines, stop names, and times. If the area has no
+// transit coverage, we fall back to the estimate we computed earlier.
+
+// Small in-session cache so we don't re-query when the user toggles the
+// route-info panel. Key: "fromLat,fromLng|toLat,toLng|YYYY-MM-DDTHH:MM"
+const _transitCache = new Map();
+
+function transitTimestamp(startTime) {
+  // Transitous expects an ISO timestamp with a Z suffix. We use today's
+  // date + the user's startTime (if set). Otherwise use "now".
+  const today = new Date().toISOString().slice(0, 10);
+  const t = startTime && /^\d{2}:\d{2}$/.test(startTime) ? `${startTime}:00` : null;
+  return t ? `${today}T${t}Z` : new Date().toISOString().replace(/\.\d+/, '');
+}
+
+// Modes Transitous returns we care about; everything else displays as the
+// raw string. The icon column lets us style them in the route info pane.
+const TRANSIT_LEG_ICON = {
+  WALK: '🚶',
+  BUS: '🚌',
+  TROLLEYBUS: '🚎',
+  TRAM: '🚊',
+  SUBWAY: '🚇',
+  METRO: '🚇',
+  RAIL: '🚆',
+  REGIONAL_RAIL: '🚆',
+  HIGHSPEED_RAIL: '🚄',
+  LONG_DISTANCE: '🚆',
+  FERRY: '⛴️',
+  CABLE_CAR: '🚠',
+  GONDOLA: '🚡',
+  FUNICULAR: '🚞',
+  AIRPLANE: '✈️',
+};
+
+async function fetchTransitPlan(from, to, startTime) {
+  const key = `${from[0]},${from[1]}|${to[0]},${to[1]}|${startTime || ''}`;
+  if (_transitCache.has(key)) return _transitCache.get(key);
+
+  const url =
+    `${TRANSITOUS}?fromPlace=${from[0]},${from[1]}` +
+    `&toPlace=${to[0]},${to[1]}` +
+    `&time=${encodeURIComponent(transitTimestamp(startTime))}`;
+
+  const ctl = new AbortController();
+  const timeout = setTimeout(() => ctl.abort(), 12000);
+  try {
+    const res = await fetch(url, { signal: ctl.signal });
+    clearTimeout(timeout);
+    if (!res.ok) throw new Error(`Transitous ${res.status}`);
+    const data = await res.json();
+    const result = (data.itineraries || []).filter((it) =>
+      // Only itineraries that use at least one real transit leg
+      (it.legs || []).some((l) => l.mode && l.mode !== 'WALK')
+    );
+    _transitCache.set(key, result);
+    return result;
+  } catch (e) {
+    clearTimeout(timeout);
+    _transitCache.set(key, null); // remember failure for the session
+    return null;
+  }
+}
+
+function fmtIsoToLocal12(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  let h = d.getHours();
+  const m = d.getMinutes();
+  const period = h >= 12 ? 'PM' : 'AM';
+  h = h % 12 || 12;
+  return `${h}:${String(m).padStart(2, '0')} ${period}`;
+}
+
+function renderTransitItinerary(it) {
+  const transitLegs = (it.legs || []).filter((l) => l.mode && l.mode !== 'WALK');
+  const linesSummary = transitLegs
+    .map((l) => {
+      const tag = l.routeShortName || l.routeLongName || l.mode;
+      return `<span class="transit-line">${TRANSIT_LEG_ICON[l.mode] || '🚌'} ${escapeHTML(tag)}</span>`;
+    })
+    .join('<span class="transit-arrow">›</span>');
+
+  const stepsHtml = (it.legs || [])
+    .map((l) => {
+      const icon = TRANSIT_LEG_ICON[l.mode] || (l.mode === 'WALK' ? '🚶' : '·');
+      const time = fmtIsoToLocal12(l.startTime);
+      const duration = fmtDuration(l.duration || 0);
+      if (l.mode === 'WALK') {
+        return `
+          <div class="transit-step transit-walk">
+            <span class="transit-step-icon">${icon}</span>
+            <div class="transit-step-body">
+              <div class="transit-step-line">Walk ${duration} to <strong>${escapeHTML(l.to?.name || '')}</strong></div>
+              <div class="transit-step-time">${time}</div>
+            </div>
+          </div>`;
+      }
+      const tag = l.routeShortName || l.routeLongName || l.mode;
+      const headsign = l.headsign ? ` toward ${escapeHTML(l.headsign)}` : '';
+      const agency = l.agencyName ? ` · ${escapeHTML(l.agencyName)}` : '';
+      return `
+        <div class="transit-step transit-ride">
+          <span class="transit-step-icon">${icon}</span>
+          <div class="transit-step-body">
+            <div class="transit-step-line">
+              <strong>${escapeHTML(tag)}</strong>${headsign}${agency}
+            </div>
+            <div class="transit-step-stops">
+              <span class="transit-stop">${escapeHTML(l.from?.name || '')}</span>
+              <span class="transit-arrow">→</span>
+              <span class="transit-stop">${escapeHTML(l.to?.name || '')}</span>
+              <span class="transit-step-time">${time} · ${duration}</span>
+            </div>
+          </div>
+        </div>`;
+    })
+    .join('');
+
+  const transfers =
+    it.transfers > 0 ? `${it.transfers} transfer${it.transfers > 1 ? 's' : ''}` : 'direct';
+  return `
+    <div class="transit-summary">
+      ${linesSummary}
+      <span class="transit-meta">${fmtDuration(it.duration)} · ${transfers}</span>
+    </div>
+    <div class="transit-steps">${stepsHtml}</div>
+  `;
+}
+
+// Called from renderRouteInfo after the DOM is in place. For each segment
+// that has a transit placeholder, fire a Transitous query and fill it in.
+async function enrichTransitSegments() {
+  const slots = [...document.querySelectorAll('.segment-transit-detail')];
+  for (const slot of slots) {
+    const segIdx = +slot.dataset.seg;
+    const from = slot.dataset.from.split(',').map(Number);
+    const to = slot.dataset.to.split(',').map(Number);
+    const modeId = slot.dataset.mode;
+    const plans = await fetchTransitPlan(from, to, state.startTime);
+
+    if (!plans || plans.length === 0) {
+      slot.innerHTML = `
+        <div class="transit-fallback">
+          No real-time ${escapeHTML(modeId)} schedule found here.
+          <a class="segment-transit"
+             href="https://www.google.com/maps/dir/?api=1&origin=${from[0]},${from[1]}&destination=${to[0]},${to[1]}&travelmode=transit"
+             target="_blank" rel="noopener">Open in Google Maps ↗</a>
+        </div>`;
+      continue;
+    }
+    // Render the best (first) itinerary. If we have several, show a toggle.
+    const best = plans[0];
+    slot.innerHTML = renderTransitItinerary(best);
+
+    // Surface the real transit duration: write it back into
+    // state.segments[i].duration so the schedule (arrival times + total
+    // time) reflects the real ride length instead of the early straight-
+    // line estimate. Then run the targeted updater to push those numbers
+    // into the DOM in place.
+    const seg = state.segments[segIdx];
+    if (seg) {
+      seg.duration = best.duration;
+      const segNode = slot.closest('.segment')?.querySelector('.segment-stats');
+      if (segNode) {
+        segNode.innerHTML = `${segNode.textContent.split(' · ')[0]} · ${fmtDuration(best.duration)} (transit)`;
+      }
+      updateScheduleDisplay();
+    }
   }
 }
 
@@ -745,17 +970,83 @@ function twoOpt(matrix, order) {
   return best;
 }
 
+// ---------- The pin-and-optimize flow ----------
+// The user picks any subset of waypoint positions to pin in place. The
+// remaining waypoints are permuted to fill the remaining positions in a way
+// that minimizes total path distance. Position 0 (the origin) is always
+// pinned by default; the user can untick it if they want — but the toast
+// confirms what they're doing.
+
 async function optimizeOrder() {
   const wps = state.waypoints;
-  const allLocated = wps.every((w) => w.latlng);
   if (wps.length < 3) {
     toast('Add at least 3 waypoints first');
     return;
   }
-  if (!allLocated) {
+  if (!wps.every((w) => w.latlng)) {
     toast('Set a location for every waypoint first');
     return;
   }
+  // Open the pin dialog. By default, the origin (position 0) is pinned.
+  // Everything else is unticked.
+  openPinDialog(new Set([0]));
+}
+
+function openPinDialog(initialPinned) {
+  const dlg = $('pinDialog');
+  const list = $('pinList');
+  const N = state.waypoints.length;
+  const pinned = new Set(initialPinned);
+
+  function render() {
+    list.innerHTML = state.waypoints
+      .map((w, i) => {
+        const checked = pinned.has(i) ? 'checked' : '';
+        const isLast = i === N - 1;
+        const isFirst = i === 0;
+        const role = isFirst ? 'Origin' : isLast ? 'Last' : 'Stop';
+        const labelText = shortName(w.name) || letterFor(i);
+        return `
+          <label class="pin-item ${checked ? 'pinned' : ''}">
+            <input type="checkbox" data-idx="${i}" ${checked} />
+            <span class="pin-letter">${letterFor(i)}</span>
+            <span class="pin-name">${escapeHTML(labelText)}</span>
+            <span class="pin-role">${role}</span>
+          </label>`;
+      })
+      .join('');
+    list.querySelectorAll('input[type="checkbox"]').forEach((cb) => {
+      cb.addEventListener('change', () => {
+        const idx = +cb.dataset.idx;
+        if (cb.checked) pinned.add(idx);
+        else pinned.delete(idx);
+        // Re-render to update the visual "pinned" class
+        render();
+      });
+    });
+  }
+
+  render();
+  dlg.hidden = false;
+
+  const cleanup = () => {
+    $('pinCancel').onclick = null;
+    $('pinConfirm').onclick = null;
+    dlg.onclick = null;
+    dlg.hidden = true;
+  };
+
+  $('pinCancel').onclick = () => cleanup();
+  dlg.onclick = (e) => { if (e.target.id === 'pinDialog') cleanup(); };
+  $('pinConfirm').onclick = async () => {
+    cleanup();
+    await runOptimizeWithPins(pinned);
+  };
+}
+
+async function runOptimizeWithPins(pinned) {
+  const wps = state.waypoints;
+  const N = wps.length;
   const coords = wps.map((w) => w.latlng);
 
   const btn = $('optimizeBtn');
@@ -765,33 +1056,37 @@ async function optimizeOrder() {
 
   let matrix;
   try {
-    // Use foot profile for a uniform pedestrian distance graph
     matrix = await fetchDistanceMatrix(coords, 'foot');
   } catch (e) {
     console.warn('Table API failed, using haversine fallback', e);
     matrix = haversineMatrix(coords);
   }
 
-  // Only the starting point (index 0) is fixed. Every other waypoint —
-  // including whatever is currently last — is just a regular point in the
-  // set and can be reordered freely to minimize total distance.
-  const N = wps.length;
-
-  if (N < 3) {
-    toast('Add at least one stop after your starting point');
-    return;
+  // Indices we're free to reorder, in their current order. These are the
+  // waypoint IDs that need to be placed into the non-pinned positions.
+  const movableIds = [];
+  const movableSlots = [];
+  for (let i = 0; i < N; i++) {
+    if (!pinned.has(i)) {
+      movableIds.push(i);
+      movableSlots.push(i);
+    }
   }
 
-  const rest = Array.from({ length: N - 1 }, (_, i) => i + 1);
-  const beforeOrder = [0, ...rest];
-  const beforeDist = pathDistance(matrix, beforeOrder);
+  const beforeDist = pathDistance(matrix, Array.from({ length: N }, (_, i) => i));
 
   let bestOrder;
-  if (rest.length <= 8) {
-    // Brute force — up to 8! = 40,320 permutations. Instant in JS.
+  if (movableIds.length <= 8) {
+    // Brute force — try every permutation of the movable waypoints,
+    // placing them in the movable slots, with pinned waypoints in their
+    // original positions.
     let bestDist = Infinity;
-    for (const perm of permutations(rest)) {
-      const order = [0, ...perm];
+    for (const perm of permutations(movableIds)) {
+      const order = new Array(N);
+      for (let i = 0; i < N; i++) if (pinned.has(i)) order[i] = i;
+      for (let k = 0; k < movableSlots.length; k++) {
+        order[movableSlots[k]] = perm[k];
+      }
       const d = pathDistance(matrix, order);
       if (d < bestDist) {
         bestDist = d;
@@ -799,14 +1094,18 @@ async function optimizeOrder() {
       }
     }
   } else {
-    // Too many for brute force — nearest neighbor + 2-opt.
-    bestOrder = nearestNeighborOrder(matrix, 0, rest);
-    bestOrder = twoOpt(matrix, bestOrder);
+    // Too many for brute force. Use a constrained nearest-neighbor: walk
+    // through positions 0..N-1; for a pinned position use its waypoint,
+    // for a movable position pick the unused waypoint closest to the
+    // previous one. Then 2-opt-refine within blocks that have no pinned
+    // waypoints between them.
+    bestOrder = constrainedNearestNeighbor(matrix, N, pinned);
+    bestOrder = twoOptWithPins(matrix, bestOrder, pinned);
   }
 
   const afterDist = pathDistance(matrix, bestOrder);
   const newWps = bestOrder.map((i) => wps[i]);
-  // Reset endpoint kinds for the new positions
+  // Re-tag endpoint kinds for the new sequence.
   const last = newWps.length - 1;
   newWps.forEach((w, i) => {
     w.kind = i === 0 ? 'origin' : i === last ? 'destination' : 'stop';
@@ -826,6 +1125,67 @@ async function optimizeOrder() {
   refreshMap();
   fitToWaypoints();
   recomputeRoute();
+}
+
+// Greedy NN that respects the pinned set. For each slot in order, either
+// use the pinned waypoint (no choice) or pick the unused waypoint closest
+// to the previous slot.
+function constrainedNearestNeighbor(matrix, N, pinned) {
+  const order = new Array(N);
+  const remaining = new Set();
+  for (let i = 0; i < N; i++) if (!pinned.has(i)) remaining.add(i);
+  let prev = null;
+  for (let pos = 0; pos < N; pos++) {
+    if (pinned.has(pos)) {
+      order[pos] = pos;
+    } else {
+      // Pick the unused waypoint closest to prev (or just any if no prev)
+      let best = -1;
+      let bestDist = Infinity;
+      for (const id of remaining) {
+        const d = prev == null ? 0 : matrix[prev][id];
+        if (d < bestDist) {
+          bestDist = d;
+          best = id;
+        }
+      }
+      order[pos] = best;
+      remaining.delete(best);
+    }
+    prev = order[pos];
+  }
+  return order;
+}
+
+// 2-opt that never moves a pinned slot. Equivalent to running 2-opt on
+// each maximal contiguous stretch of unpinned positions.
+function twoOptWithPins(matrix, order, pinned) {
+  const n = order.length;
+  let best = order.slice();
+  let improved = true;
+  while (improved) {
+    improved = false;
+    for (let i = 1; i < n - 2; i++) {
+      if (pinned.has(i)) continue;
+      for (let j = i + 1; j < n - 1; j++) {
+        if (pinned.has(j)) break; // crossing a pin would move it
+        // Verify the slice [i..j] contains no pinned positions
+        let crosses = false;
+        for (let k = i; k <= j; k++) {
+          if (pinned.has(k)) { crosses = true; break; }
+        }
+        if (crosses) continue;
+        const candidate = best
+          .slice(0, i)
+          .concat(best.slice(i, j + 1).reverse(), best.slice(j + 1));
+        if (pathDistance(matrix, candidate) < pathDistance(matrix, best)) {
+          best = candidate;
+          improved = true;
+        }
+      }
+    }
+  }
+  return best;
 }
 
 // ---------------- DISCOVER NEARBY POIs ----------------
@@ -1166,12 +1526,13 @@ function appendStop() {
 
 function clearAll() {
   state.waypoints = [
-    { name: '', latlng: null, kind: 'origin' },
-    { name: '', latlng: null, kind: 'destination' },
+    { name: '', latlng: null, kind: 'origin', stayMin: 0 },
+    { name: '', latlng: null, kind: 'destination', stayMin: 0 },
   ];
   state.segmentModes = ['walk'];
   state.segments = [];
   state.suggestions = [];
+  state.startTime = '';
   setActiveContext(null);
   stopPlay();
   suggestionsLayer.clearLayers();
@@ -1289,11 +1650,28 @@ function totalDistance() {
   return state.segments.reduce((acc, s) => acc + (s?.distance || 0), 0);
 }
 
+// Total travel time across all routed segments (seconds).
+function totalTravelSeconds() {
+  return state.segments.reduce((acc, s) => acc + (s?.duration || 0), 0);
+}
+
+// Total stay time across all waypoints (seconds). The last waypoint's stay
+// doesn't add to the journey duration (you're already there), so it's
+// excluded — only stays before subsequent segments count.
+function totalStaySeconds() {
+  const lastIdx = state.waypoints.length - 1;
+  return state.waypoints.reduce((acc, w, i) => {
+    if (i === lastIdx) return acc; // arrival, no onward leg
+    return acc + (Number(w.stayMin) || 0) * 60;
+  }, 0);
+}
+
 function renderDistance() {
   const d = totalDistance();
-  const text =
+  $('distanceValue').textContent =
     state.units === 'km' ? `${fmtKm(d)} km` : `${fmtMi(d)} mi`;
-  $('distanceValue').textContent = text;
+  const total = totalTravelSeconds() + totalStaySeconds();
+  $('timeValue').textContent = fmtDuration(total);
 }
 
 function renderRouteInfo() {
@@ -1305,31 +1683,198 @@ function renderRouteInfo() {
     : 'Show route information';
   if (!state.showInfo) return;
 
-  let html = '<h3>BY SEGMENT</h3>';
-  for (let i = 0; i < state.waypoints.length - 1; i++) {
-    const from = letterFor(i);
-    const to = letterFor(i + 1);
+  const N = state.waypoints.length;
+  const lastIdx = N - 1;
+  const hasSchedule = !!state.startTime;
+
+  // Precompute the arrival time at each waypoint based on startTime + travel
+  // + stays. arrivals[0] = startTime. arrivals[i+1] = arrivals[i] + stay[i] + travel[i].
+  const arrivals = new Array(N).fill(null);
+  if (hasSchedule) {
+    arrivals[0] = state.startTime;
+    let cursor = state.startTime;
+    for (let i = 0; i < N - 1; i++) {
+      const stayMin = Number(state.waypoints[i].stayMin) || 0;
+      const travelMin = state.segments[i]
+        ? Math.round(state.segments[i].duration / 60)
+        : 0;
+      cursor = addMinutesToTime(cursor, stayMin + travelMin) || cursor;
+      arrivals[i + 1] = cursor;
+    }
+  }
+
+  // Friendly label for a waypoint — shortName, or the letter as fallback.
+  const label = (i) => {
+    const wp = state.waypoints[i];
+    return shortName(wp?.name) || letterFor(i);
+  };
+
+  let html = '';
+
+  // ---- Schedule controls ----
+  const endTime = arrivals[lastIdx];
+  const endStay = Number(state.waypoints[lastIdx]?.stayMin) || 0;
+  const endTimeWithStay = endStay ? addMinutesToTime(endTime, endStay) : null;
+  html += `
+    <div class="schedule-block">
+      <label class="schedule-row">
+        <span class="schedule-label">🕐 Start time</span>
+        <input type="time" class="schedule-input" id="scheduleStartTime"
+               value="${escapeAttr(state.startTime)}" />
+        ${state.startTime ? `<button class="schedule-clear" id="scheduleClear" title="Clear start time">×</button>` : ''}
+      </label>
+      ${hasSchedule ? `
+        <div class="schedule-summary">
+          End: <strong>${fmtTime12(endTime) || '—'}</strong>
+          ${endStay
+            ? ` (plus ${endStay} min at ${escapeHTML(label(lastIdx))} → ${fmtTime12(endTimeWithStay)})`
+            : ''}
+        </div>` : ''}
+    </div>
+  `;
+
+  // ---- Per-segment list ----
+  html += '<h3>BY SEGMENT</h3>';
+  for (let i = 0; i < N - 1; i++) {
+    const fromLabel = label(i);
+    const toLabel = label(i + 1);
+    const wpFrom = state.waypoints[i];
+    const wpTo = state.waypoints[i + 1];
     const seg = state.segments[i];
-    const mode = MODE_BY_ID[state.segmentModes[i]];
+    const modeId = state.segmentModes[i];
+    const mode = MODE_BY_ID[modeId];
+
     let stats = '—';
     if (seg) {
       const d =
         state.units === 'km'
           ? `${fmtKm(seg.distance)} km`
           : `${fmtMi(seg.distance)} mi`;
-      stats = seg.duration
-        ? `${d} · ${fmtMin(seg.duration)} min`
-        : d;
+      stats = `${d} · ${fmtDuration(seg.duration)}`;
     }
+
+    const arriveAt = hasSchedule
+      ? `<div class="segment-arrive">Arrive at ${escapeHTML(toLabel)}: <strong>${fmtTime12(arrivals[i + 1])}</strong></div>`
+      : '';
+
+    const stayInput = i + 1 < lastIdx
+      ? `<div class="segment-stay">
+           <label>⏱ Stay at ${escapeHTML(toLabel)}</label>
+           <input type="number" min="0" step="5" class="segment-stay-input"
+                  data-idx="${i + 1}" placeholder="0"
+                  value="${wpTo.stayMin || ''}" /> min
+         </div>`
+      : '';
+
+    // Show transit detail block (filled in async by enrichTransitSegments).
+    const transitable = (modeId === 'train' || modeId === 'bus') && wpFrom.latlng && wpTo.latlng;
+    const transitBlock = transitable
+      ? `<div class="segment-transit-detail" data-seg="${i}" data-from="${wpFrom.latlng.join(',')}" data-to="${wpTo.latlng.join(',')}" data-mode="${modeId}">
+           <span class="transit-loading">Looking up real ${escapeHTML(mode.label.toLowerCase())} options…</span>
+         </div>`
+      : '';
+
     html += `
       <div class="segment">
-        <span class="segment-label">${from} → ${to}</span>
-        <span class="segment-mode">${mode.icon} ${mode.label}</span>
-        <span class="segment-stats">${stats}</span>
+        <div class="segment-main">
+          <span class="segment-label">${escapeHTML(fromLabel)} → ${escapeHTML(toLabel)}</span>
+          <span class="segment-mode">${mode.icon} ${mode.label}</span>
+          <span class="segment-stats">${stats}</span>
+        </div>
+        ${arriveAt}
+        ${stayInput}
+        ${transitBlock}
       </div>
     `;
   }
+
   box.innerHTML = html;
+  bindRouteInfoEvents();
+  enrichTransitSegments();
+}
+
+function bindRouteInfoEvents() {
+  // Start-time changes can show/hide the clear button + summary, so a full
+  // re-render is necessary. Native <input type="time"> only fires `change`
+  // once committed, so there's no focus-loss-mid-typing problem here.
+  const startInput = $('scheduleStartTime');
+  if (startInput) {
+    startInput.addEventListener('change', (e) => {
+      state.startTime = e.target.value || '';
+      renderRouteInfo();
+    });
+  }
+  const clearBtn = $('scheduleClear');
+  if (clearBtn) {
+    clearBtn.addEventListener('click', () => {
+      state.startTime = '';
+      renderRouteInfo();
+    });
+  }
+  // Stay inputs use a TARGETED update — we recompute arrivals + total time
+  // and patch only the text nodes that show them, never touching the input
+  // element. That's what lets the user keep typing without losing focus.
+  document.querySelectorAll('.segment-stay-input').forEach((inp) => {
+    inp.addEventListener('input', (e) => {
+      const idx = +e.target.dataset.idx;
+      const raw = e.target.value;
+      // Treat empty as 0 but keep the input's typed value as-is. parseInt
+      // also handles intermediate states like "" or partial entry.
+      const parsed = parseInt(raw, 10);
+      state.waypoints[idx].stayMin =
+        Number.isNaN(parsed) ? 0 : Math.max(0, parsed);
+      updateScheduleDisplay();
+    });
+  });
+}
+
+// Recompute and re-render JUST the time text everywhere (arrivals, end
+// summary, distance-bar total). Doesn't touch input elements, so it's safe
+// to call on every keystroke.
+function updateScheduleDisplay() {
+  const N = state.waypoints.length;
+  const lastIdx = N - 1;
+  const hasSchedule = !!state.startTime;
+
+  // Recompute arrival time at each waypoint.
+  const arrivals = new Array(N).fill(null);
+  if (hasSchedule) {
+    arrivals[0] = state.startTime;
+    let cursor = state.startTime;
+    for (let i = 0; i < N - 1; i++) {
+      const stayMin = Number(state.waypoints[i].stayMin) || 0;
+      const travelMin = state.segments[i]
+        ? Math.round(state.segments[i].duration / 60)
+        : 0;
+      cursor = addMinutesToTime(cursor, stayMin + travelMin) || cursor;
+      arrivals[i + 1] = cursor;
+    }
+  }
+
+  // Patch each "Arrive at X: <strong>HH:MM AM</strong>" line.
+  document.querySelectorAll('.segment-arrive strong').forEach((el, i) => {
+    el.textContent = fmtTime12(arrivals[i + 1]);
+  });
+
+  // Patch the schedule summary (the "End:" line).
+  const summaryEl = document.querySelector('.schedule-summary');
+  if (summaryEl && hasSchedule) {
+    const endTime = arrivals[lastIdx];
+    const endStay = Number(state.waypoints[lastIdx]?.stayMin) || 0;
+    const endTimeWithStay = endStay ? addMinutesToTime(endTime, endStay) : null;
+    const label =
+      shortName(state.waypoints[lastIdx]?.name) || letterFor(lastIdx);
+    summaryEl.innerHTML = `
+      End: <strong>${fmtTime12(endTime) || '—'}</strong>
+      ${endStay
+        ? ` (plus ${endStay} min at ${escapeHTML(label)} → ${fmtTime12(endTimeWithStay)})`
+        : ''}
+    `;
+  }
+
+  // Patch the total time in the distance bar.
+  const total = totalTravelSeconds() + totalStaySeconds();
+  $('timeValue').textContent = fmtDuration(total);
 }
 
 // ---------------- TRIPS / DAYS / ROUTES ----------------
@@ -1444,9 +1989,11 @@ function makeRoutePayload(name) {
       latlng: w.latlng,
       kind: w.kind,
       customName: !!w.customName,
+      stayMin: Number(w.stayMin) || 0,
     })),
     segmentModes: [...state.segmentModes],
     units: state.units,
+    startTime: state.startTime || '',
   };
 }
 
@@ -1457,9 +2004,11 @@ function updateRouteInPlace(route) {
     latlng: w.latlng,
     kind: w.kind,
     customName: !!w.customName,
+    stayMin: Number(w.stayMin) || 0,
   }));
   route.segmentModes = [...state.segmentModes];
   route.units = state.units;
+  route.startTime = state.startTime || '';
 }
 
 function saveCurrent() {
@@ -1547,9 +2096,13 @@ function openRoute(tripId, dayId, routeId) {
   const day = trip?.days.find((d) => d.id === dayId);
   const route = day?.routes.find((r) => r.id === routeId);
   if (!route) return;
-  state.waypoints = route.waypoints.map((w) => ({ ...w }));
+  state.waypoints = route.waypoints.map((w) => ({
+    ...w,
+    stayMin: Number(w.stayMin) || 0,
+  }));
   state.segmentModes = [...route.segmentModes];
   state.units = route.units || 'km';
+  state.startTime = route.startTime || '';
   document.querySelectorAll('.unit').forEach((u) => {
     u.classList.toggle('active', u.dataset.unit === state.units);
   });
